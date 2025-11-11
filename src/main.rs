@@ -393,7 +393,7 @@ async fn images_uploader(
 
         let image = Image {
             id,
-            url: format!("https://multimedia-commons.s3-us-west-2.amazonaws.com/data/images/{key}"),
+            url: format!("https://multimedia-commons.s3-us-west-2.amazonaws.com/{key}"),
             base64,
         };
 

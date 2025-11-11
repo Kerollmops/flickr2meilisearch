@@ -129,11 +129,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let compute_base64_handle = tokio::task::spawn_blocking(|| {
+    let compute_base64_handle = tokio::task::spawn_blocking(move || {
         let pool = rayon::ThreadPoolBuilder::new().build()?;
         pool.install(|| {
             compute_images_base64(
                 base64_encoder_pb,
+                // Dry running will make the pipeline go up to this point
+                // and don't send to Meilisearch
+                dry_run,
                 images_to_compute_base64_receiver,
                 base64_to_upload_sender,
             )
@@ -141,10 +144,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let uploader_handle = tokio::spawn({
-        // Strange but when the dry_run option is enabled, we simply create
-        // an immediately dropped channel receiver in place of original/normal receiver
-        let base64_to_upload_receiver =
-            if dry_run { tokio::sync::mpsc::channel(1).1 } else { base64_to_upload_receiver };
         async move {
             images_uploader(client, meili_client, uploader_pb, base64_to_upload_receiver).await
         }
@@ -283,14 +282,17 @@ async fn download_images(
 
 fn compute_images_base64(
     pb: ProgressBar,
+    dry_run: bool,
     images_to_compute_base64_receiver: StdReceiver<(ListObjectsContent, Bytes)>,
     base64_to_upload_sender: Sender<(ListObjectsContent, String)>,
 ) -> anyhow::Result<()> {
     images_to_compute_base64_receiver.into_iter().par_bridge().try_for_each(|(content, bytes)| {
         let base64 = BASE64_STANDARD.encode(&bytes);
-        base64_to_upload_sender
-            .blocking_send((content, base64))
-            .context("While sending the base64 to the uploader")?;
+        if !dry_run {
+            base64_to_upload_sender
+                .blocking_send((content, base64))
+                .context("While sending the base64 to the uploader")?;
+        }
         pb.inc(1);
         Ok(())
     })

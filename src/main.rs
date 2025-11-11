@@ -1,13 +1,14 @@
 use std::borrow::Cow;
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender};
-use std::{num::NonZeroUsize, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use backoff::ExponentialBackoff;
-use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
+use base64::Engine as _;
 use byte_unit::Byte;
 use bytes::Bytes;
 use clap::Parser;
@@ -17,10 +18,9 @@ use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use reqwest::header::AUTHORIZATION;
-use rusty_s3::{
-    Bucket, S3Action, UrlStyle,
-    actions::{ListObjectsV2, list_objects_v2::ListObjectsContent},
-};
+use rusty_s3::actions::list_objects_v2::ListObjectsContent;
+use rusty_s3::actions::ListObjectsV2;
+use rusty_s3::{Bucket, S3Action, UrlStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -195,17 +195,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Waits by itself
+    // Note that join waits by itself
     let (iterator_result, downloaded_result, compute_base64_result, uploader_result) =
         tokio::join!(iterator_handle, downloaded_handle, compute_base64_handle, uploader_handle);
 
-    // Try to get the results
-    iterator_result??;
-    downloaded_result??;
-    compute_base64_result??;
-    uploader_result??;
+    // Note that we make sure that the latest operations
+    // in the pipeline are evaluated before the earliest ones
+    let uploader_err = uploader_result?.err();
+    let compute_base64_err = compute_base64_result?.err();
+    let downloaded_err = downloaded_result?.err();
+    let iterator_err = iterator_result?.err();
 
-    Ok(())
+    combine_errors(
+        [uploader_err, compute_base64_err, downloaded_err, iterator_err].into_iter().flatten(),
+    )
 }
 
 async fn iterate_through_objects(
@@ -473,6 +476,13 @@ async fn send_clear_images_from_documents(
     }
 
     Ok(())
+}
+
+/// Combines multiple errors into a single error.
+fn combine_errors(errors: impl IntoIterator<Item = anyhow::Error>) -> anyhow::Result<()> {
+    let mut errors = errors.into_iter();
+    let Some(initial) = errors.next() else { return Ok(()) };
+    Err(errors.fold(initial, |combined, error| combined.context(error)))
 }
 
 /// BytesCounter is a struct that counts the number of bytes written to it.

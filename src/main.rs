@@ -40,7 +40,7 @@ const MEILI_CHUNK_SIZE: usize = 1024 * 1024 * 10; // 10 MiB
 
 /// The frequency in terms of number of sent images at which we clear the
 /// images from Meilisearch by using the edit-documents-by-function route.
-const CLEAR_MEILISEARCH_IMAGES_FREQUENCY: u64 = 10_000;
+const CLEAR_MEILISEARCH_IMAGES_FREQUENCY: u64 = 100_000;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]

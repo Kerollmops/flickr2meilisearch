@@ -398,7 +398,7 @@ async fn send_clear_images_from_documents(
 
     let request_builder = client.post(url);
     let request_builder = match meili_client.get_api_key() {
-        Some(api_key) => request_builder.header(AUTHORIZATION, api_key),
+        Some(api_key) => request_builder.header(AUTHORIZATION, format!("Bearer {api_key}")),
         None => request_builder,
     };
 

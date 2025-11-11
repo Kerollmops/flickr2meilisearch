@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 use std::io;
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender};
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
+
+use futures::stream::{self, StreamExt};
+use std::pin::pin;
 
 use anyhow::Context;
 use backoff::ExponentialBackoff;
@@ -215,63 +218,67 @@ async fn download_images(
     client: reqwest::Client,
     bucket: Bucket,
     pb: ProgressBar,
-    mut images_to_download_receiver: Receiver<ListObjectsContent>,
+    images_to_download_receiver: Receiver<ListObjectsContent>,
     images_to_compute_base64_sender: StdSyncSender<(ListObjectsContent, Bytes)>,
 ) -> anyhow::Result<()> {
-    let mut in_flight = VecDeque::with_capacity(MAX_IN_FLIGHT_DOWNLOADS.get());
-    while let Some(content) = images_to_download_receiver.recv().await {
-        if in_flight.len() >= MAX_IN_FLIGHT_DOWNLOADS.get() {
-            let request = in_flight.pop_front().unwrap();
-            let (content, jpeg_bytes): (_, Bytes) = request.await?;
-            let bytes_to_download = jpeg_bytes.len();
-            // NOTE: Not sure about this part. It would be preferable to put
-            //       it in another in flight to-be-base64-encoded dequeue.
-            tokio::task::spawn_blocking({
-                let images_to_compute_base64_sender = images_to_compute_base64_sender.clone();
-                move || images_to_compute_base64_sender.send((content, jpeg_bytes))
-            })
-            .await??;
-            pb.inc(bytes_to_download as u64);
-        }
+    // Create a stream from the receiver
+    let download_stream = stream::unfold(images_to_download_receiver, |mut receiver| async move {
+        receiver.recv().await.map(|content| (content, receiver))
+    });
 
-        let request = backoff::future::retry(ExponentialBackoff::default(), {
-            // NOTE: There is a lot too many clones for my taste
+    // Use buffer_unordered to manage in-flight downloads
+    let download_futures = download_stream
+        .map(|content| {
             let bucket = bucket.clone();
             let client = client.clone();
-            let content = content.clone();
-            move || {
-                let bucket = bucket.clone();
-                let client = client.clone();
-                let content = content.clone();
-                async move {
-                    let get_action = bucket.get_object(None, content.key.as_str());
-                    // signing a request
-                    let signed_action = get_action.sign(PRESIGNED_URL_DURATION);
-                    let response = client
-                        .get(signed_action)
-                        .send()
-                        .await
-                        .context("While sending HTTP list objects v2 request")?;
-                    let jpeg_image = response
-                        .bytes()
-                        .await
-                        .context("While reading the bytes from an HTTP list objects v2 request")?;
-                    Ok((content, jpeg_image))
-                }
+            async move {
+                let request_result = backoff::future::retry(ExponentialBackoff::default(), {
+                    let bucket = bucket.clone();
+                    let client = client.clone();
+                    let content = content.clone();
+                    move || {
+                        let bucket = bucket.clone();
+                        let client = client.clone();
+                        let content = content.clone();
+                        async move {
+                            let get_action = bucket.get_object(None, content.key.as_str());
+                            // signing a request
+                            let signed_action = get_action.sign(PRESIGNED_URL_DURATION);
+                            let response = client
+                                .get(signed_action)
+                                .send()
+                                .await
+                                .context("While sending HTTP get object request")?;
+                            let jpeg_image = response.bytes().await.context(
+                                "While reading the bytes from an HTTP get object request",
+                            )?;
+                            Ok((content, jpeg_image))
+                        }
+                    }
+                })
+                .await;
+                request_result
             }
-        });
+        })
+        // By using buffered unordered we can pull multiple downloads
+        // concurrently and it's way faster than using a VecDeque by hand.
+        .buffer_unordered(MAX_IN_FLIGHT_DOWNLOADS.get());
 
-        in_flight.push_back(request);
-    }
+    // Pin the stream to satisfy Unpin trait requirement
+    let mut download_futures = pin!(download_futures);
 
-    for request in in_flight {
-        let (content, jpeg_bytes) = request.await?;
+    // Process completed downloads
+    while let Some(result) = download_futures.next().await {
+        let (content, jpeg_bytes) = result?;
         let bytes_to_download = jpeg_bytes.len();
+
+        // Send to base64 computation
         tokio::task::spawn_blocking({
             let images_to_compute_base64_sender = images_to_compute_base64_sender.clone();
             move || images_to_compute_base64_sender.send((content, jpeg_bytes))
         })
         .await??;
+
         pb.inc(bytes_to_download as u64);
     }
 

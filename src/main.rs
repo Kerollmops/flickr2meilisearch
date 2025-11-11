@@ -1,13 +1,14 @@
 use std::borrow::Cow;
+use std::io;
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender};
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
-use std::{env, io};
 
 use anyhow::Context;
 use backoff::ExponentialBackoff;
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
+use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
@@ -32,8 +33,27 @@ const MAX_IN_FLIGHT_DOWNLOADS: NonZeroUsize = NonZeroUsize::new(2000).unwrap();
 /// Maximum size of a chunk to send to Meilisearch
 const MEILI_CHUNK_SIZE: usize = 1024 * 1024 * 10; // 10 MiB
 
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// URL of the Meilisearch instance
+    #[arg(long)]
+    meilisearch_url: String,
+
+    /// API key for the Meilisearch instance
+    #[arg(long)]
+    meilisearch_api_key: Option<String>,
+
+    /// Dry run mode: Do not send any request to Meilisearch.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
+    let Args { meilisearch_url, meilisearch_api_key, dry_run } = Args::parse();
+
     // install global subscriber configured based on RUST_LOG envvar.
     tracing_subscriber::fmt::init();
 
@@ -48,11 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create an HTTP client and a Meilisearch client
     let client = reqwest::ClientBuilder::new().build()?;
-    let meilisearch_url =
-        env::var("MEILISEARCH_URL").context("Reading env variable `MEILISEARCH_URL`")?;
-    let meilisearch_api_key =
-        env::var("MEILISEARCH_API_KEY").context("Reading env variable `MEILISEARCH_API_KEY`")?;
-    let meili_client = MeiliClient::new(meilisearch_url, Some(meilisearch_api_key))
+    let meili_client = MeiliClient::new(meilisearch_url, meilisearch_api_key)
         .context("While creating the Meilisearch client")?;
 
     let (images_to_download_sender, images_to_download_receiver) = tokio::sync::mpsc::channel(200);
@@ -122,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let uploader_handle = tokio::spawn({
+        // Strange but when the dry_run option is enabled, we simply create
+        // an immediately dropped channel receiver in place of original/normal receiver
+        let base64_to_upload_receiver =
+            if dry_run { tokio::sync::mpsc::channel(1).1 } else { base64_to_upload_receiver };
         async move { images_uploader(meili_client, uploader_pb, base64_to_upload_receiver).await }
     });
 
@@ -337,8 +357,6 @@ async fn images_uploader(
         })
         .await?;
     }
-
-    pb.finish();
 
     Ok(())
 }

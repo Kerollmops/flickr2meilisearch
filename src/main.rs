@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .unwrap(),
     );
-    let downloaded_pb = ProgressBar::new(TOTAL_NUMBER_OF_IMAGES).with_style(
+    let downloaded_pb = ProgressBar::new_spinner().with_style(
         ProgressStyle::with_template("[{elapsed}] Downloader {binary_bytes_per_sec}").unwrap(),
     );
     let base64_encoder_pb = ProgressBar::new(TOTAL_NUMBER_OF_IMAGES).with_style(
@@ -97,11 +97,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .unwrap(),
     );
-    let uploader_pb = ProgressBar::new(TOTAL_NUMBER_OF_IMAGES).with_style(
-        ProgressStyle::with_template(
-            "[{elapsed}] Uploader {wide_bar} {human_pos}/~{human_len} ({eta})",
-        )
-        .unwrap(),
+    let uploader_pb = ProgressBar::new_spinner().with_style(
+        ProgressStyle::with_template("[{elapsed}] Uploader {binary_bytes_per_sec}").unwrap(),
     );
 
     let mpb = MultiProgress::new();
@@ -349,7 +346,7 @@ async fn images_uploader(
                 Ok(())
             })
             .await?;
-            pb.inc(1);
+            pb.inc(current_chunk_size as u64);
             buffer.clear();
             current_chunk_size = 0;
         }
@@ -377,7 +374,6 @@ async fn images_uploader(
             Ok(())
         })
         .await?;
-        pb.inc(1);
     }
 
     // Just to make sure we don't send a request if we are in dry-run mode

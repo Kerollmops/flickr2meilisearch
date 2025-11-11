@@ -77,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
     } = Args::parse();
 
     // install global subscriber configured based on RUST_LOG envvar.
-    tracing_subscriber::fmt::init();
+    eprintln!("Writing logs to the errors.txt file");
+    let error_file = std::fs::OpenOptions::new().append(true).create(true).open("errors.txt")?;
+    tracing_subscriber::fmt::fmt().with_writer(error_file).init();
 
     // setting up a bucket
     let url = "https://s3.amazonaws.com";

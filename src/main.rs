@@ -1,17 +1,17 @@
 use std::borrow::Cow;
 use std::io;
+use std::pin::pin;
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender};
 use std::{num::NonZeroUsize, time::Duration};
-
-use futures::stream::{self, StreamExt};
-use std::pin::pin;
 
 use anyhow::Context;
 use backoff::ExponentialBackoff;
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
+use byte_unit::Byte;
 use bytes::Bytes;
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
@@ -26,23 +26,7 @@ use serde_json::json;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 
-/// Estimated total number of images in the bucket
-const TOTAL_NUMBER_OF_IMAGES: u64 = 100_000_000;
-
-/// Duration for which the presigned URL is valid
-const PRESIGNED_URL_DURATION: Duration = Duration::from_secs(60 * 60);
-
-/// Maximum number of downloads in flight at any given time
-const MAX_IN_FLIGHT_DOWNLOADS: NonZeroUsize = NonZeroUsize::new(2000).unwrap();
-
-/// Maximum size of a chunk to send to Meilisearch
-const MEILI_CHUNK_SIZE: usize = 1024 * 1024 * 10; // 10 MiB
-
-/// The frequency in terms of number of sent images at which we clear the
-/// images from Meilisearch by using the edit-documents-by-function route.
-const CLEAR_MEILISEARCH_IMAGES_FREQUENCY: u64 = 100_000;
-
-/// Simple program to greet a person
+/// Program to sync Flickr images to Meilisearch
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -57,11 +41,40 @@ struct Args {
     /// Dry run mode: Do not send any request to Meilisearch.
     #[arg(long)]
     dry_run: bool,
+
+    /// Estimated total number of images in the bucket
+    #[arg(long, default_value = "100000000")]
+    total_images: u64,
+
+    /// Duration for which the presigned URL is valid (in seconds)
+    #[arg(long, default_value = "3600")]
+    presigned_url_duration_secs: u64,
+
+    /// Maximum number of downloads in flight at any given time
+    #[arg(long, default_value = "2000")]
+    max_in_flight_downloads: usize,
+
+    /// Maximum size of a chunk to send to Meilisearch
+    #[arg(long, default_value = "10MiB")]
+    meili_chunk_size: Byte,
+
+    /// The frequency in terms of number of sent images at which we clear images from Meilisearch
+    #[arg(long, default_value = "100000")]
+    clear_images_frequency: u64,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
-    let Args { meilisearch_url, meilisearch_api_key, dry_run } = Args::parse();
+    let Args {
+        meilisearch_url,
+        meilisearch_api_key,
+        dry_run,
+        total_images,
+        presigned_url_duration_secs,
+        max_in_flight_downloads,
+        meili_chunk_size,
+        clear_images_frequency,
+    } = Args::parse();
 
     // install global subscriber configured based on RUST_LOG envvar.
     tracing_subscriber::fmt::init();
@@ -85,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         std::sync::mpsc::sync_channel(200);
     let (base64_to_upload_sender, base64_to_upload_receiver) = tokio::sync::mpsc::channel(200);
 
-    let iterator_pb = ProgressBar::new(TOTAL_NUMBER_OF_IMAGES).with_style(
+    let iterator_pb = ProgressBar::new(total_images).with_style(
         ProgressStyle::with_template(
             "[{elapsed}] Iterator {wide_bar} {human_pos}/~{human_len} ({eta})",
         )
@@ -94,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let downloaded_pb = ProgressBar::new_spinner().with_style(
         ProgressStyle::with_template("[{elapsed}] Downloader {binary_bytes_per_sec}").unwrap(),
     );
-    let base64_encoder_pb = ProgressBar::new(TOTAL_NUMBER_OF_IMAGES).with_style(
+    let base64_encoder_pb = ProgressBar::new(total_images).with_style(
         ProgressStyle::with_template(
             "[{elapsed}] Base64 Encoder {wide_bar} {human_pos}/~{human_len} ({eta})",
         )
@@ -113,13 +126,23 @@ async fn main() -> anyhow::Result<()> {
     let iterator_handle = tokio::spawn({
         let client = client.clone();
         let bucket = bucket.clone();
+        let presigned_url_duration = Duration::from_secs(presigned_url_duration_secs);
         async move {
-            iterate_through_objects(client, bucket, iterator_pb, images_to_download_sender).await
+            iterate_through_objects(
+                client,
+                bucket,
+                iterator_pb,
+                images_to_download_sender,
+                presigned_url_duration,
+            )
+            .await
         }
     });
 
     let downloaded_handle = tokio::spawn({
         let client = client.clone();
+        let presigned_url_duration = Duration::from_secs(presigned_url_duration_secs);
+        let max_in_flight = NonZeroUsize::new(max_in_flight_downloads).unwrap();
         async move {
             download_images(
                 client,
@@ -127,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
                 downloaded_pb,
                 images_to_download_receiver,
                 images_to_compute_base64_sender,
+                presigned_url_duration,
+                max_in_flight,
             )
             .await
         }
@@ -147,8 +172,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let uploader_handle = tokio::spawn({
+        let meili_chunk_size = meili_chunk_size.as_u64() as usize;
+        let clear_frequency = clear_images_frequency;
         async move {
-            images_uploader(client, meili_client, uploader_pb, base64_to_upload_receiver).await
+            images_uploader(
+                client,
+                meili_client,
+                uploader_pb,
+                base64_to_upload_receiver,
+                meili_chunk_size,
+                clear_frequency,
+            )
+            .await
         }
     });
 
@@ -170,6 +205,7 @@ async fn iterate_through_objects(
     bucket: Bucket,
     pb: ProgressBar,
     images_to_download_sender: Sender<ListObjectsContent>,
+    presigned_url_duration: Duration,
 ) -> anyhow::Result<()> {
     let mut continuation_token = None;
     loop {
@@ -182,7 +218,7 @@ async fn iterate_through_objects(
 
         let mut list = backoff::future::retry(ExponentialBackoff::default(), || async {
             // signing a request
-            let signed_action = list_action.sign(PRESIGNED_URL_DURATION);
+            let signed_action = list_action.sign(presigned_url_duration);
             let response = client
                 .get(signed_action)
                 .send()
@@ -220,6 +256,8 @@ async fn download_images(
     pb: ProgressBar,
     images_to_download_receiver: Receiver<ListObjectsContent>,
     images_to_compute_base64_sender: StdSyncSender<(ListObjectsContent, Bytes)>,
+    presigned_url_duration: Duration,
+    max_in_flight_downloads: NonZeroUsize,
 ) -> anyhow::Result<()> {
     // Create a stream from the receiver
     let download_stream = stream::unfold(images_to_download_receiver, |mut receiver| async move {
@@ -243,7 +281,7 @@ async fn download_images(
                         async move {
                             let get_action = bucket.get_object(None, content.key.as_str());
                             // signing a request
-                            let signed_action = get_action.sign(PRESIGNED_URL_DURATION);
+                            let signed_action = get_action.sign(presigned_url_duration);
                             let response = client
                                 .get(signed_action)
                                 .send()
@@ -260,9 +298,7 @@ async fn download_images(
                 request_result
             }
         })
-        // By using buffered unordered we can pull multiple downloads
-        // concurrently and it's way faster than using a VecDeque by hand.
-        .buffer_unordered(MAX_IN_FLIGHT_DOWNLOADS.get());
+        .buffer_unordered(max_in_flight_downloads.get());
 
     // Pin the stream to satisfy Unpin trait requirement
     let mut download_futures = pin!(download_futures);
@@ -317,6 +353,8 @@ async fn images_uploader(
     meili_client: MeiliClient,
     pb: ProgressBar,
     mut base64_to_upload_receiver: Receiver<(ListObjectsContent, String)>,
+    meili_chunk_size: usize,
+    clear_images_frequency: u64,
 ) -> anyhow::Result<()> {
     let images = meili_client.index("images");
     let edit_documents_to_clear_images = json!({
@@ -346,7 +384,7 @@ async fn images_uploader(
         serde_json::to_writer(&mut bytes_counter, &image)?;
         let BytesCounter { count } = bytes_counter;
 
-        if current_chunk_size + count >= MEILI_CHUNK_SIZE {
+        if current_chunk_size + count >= meili_chunk_size {
             backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
                 images
                     .add_documents(&buffer, None)
@@ -360,7 +398,7 @@ async fn images_uploader(
             current_chunk_size = 0;
         }
 
-        if pb.position() % CLEAR_MEILISEARCH_IMAGES_FREQUENCY == 0 {
+        if pb.position() != 0 && pb.position() % clear_images_frequency == 0 {
             send_clear_images_from_documents(
                 &client,
                 &meili_client,

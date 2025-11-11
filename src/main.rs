@@ -13,11 +13,13 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
 use rayon::iter::{ParallelBridge, ParallelIterator};
+use reqwest::header::AUTHORIZATION;
 use rusty_s3::{
     Bucket, S3Action, UrlStyle,
     actions::{ListObjectsV2, list_objects_v2::ListObjectsContent},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 
@@ -32,6 +34,10 @@ const MAX_IN_FLIGHT_DOWNLOADS: NonZeroUsize = NonZeroUsize::new(2000).unwrap();
 
 /// Maximum size of a chunk to send to Meilisearch
 const MEILI_CHUNK_SIZE: usize = 1024 * 1024 * 10; // 10 MiB
+
+/// The frequency in terms of number of sent images at which we clear the
+/// images from Meilisearch by using the edit-documents-by-function route.
+const CLEAR_MEILISEARCH_IMAGES_FREQUENCY: u64 = 10_000;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -142,7 +148,9 @@ async fn main() -> anyhow::Result<()> {
         // an immediately dropped channel receiver in place of original/normal receiver
         let base64_to_upload_receiver =
             if dry_run { tokio::sync::mpsc::channel(1).1 } else { base64_to_upload_receiver };
-        async move { images_uploader(meili_client, uploader_pb, base64_to_upload_receiver).await }
+        async move {
+            images_uploader(client, meili_client, uploader_pb, base64_to_upload_receiver).await
+        }
     });
 
     // Waits by itself
@@ -299,11 +307,16 @@ struct Image {
 }
 
 async fn images_uploader(
+    client: reqwest::Client,
     meili_client: MeiliClient,
     pb: ProgressBar,
     mut base64_to_upload_receiver: Receiver<(ListObjectsContent, String)>,
 ) -> anyhow::Result<()> {
     let images = meili_client.index("images");
+    let edit_documents_to_clear_images = json!({
+        "filter": null,
+        "function": "doc._vectors = #{ bedrock: #{ regenerate: false } }; doc.remove(\"base64\")"
+    });
 
     let mut buffer = Vec::new();
     let mut current_chunk_size = 0;
@@ -333,12 +346,21 @@ async fn images_uploader(
                     .add_documents(&buffer, None)
                     .await
                     .context("While sending a chunk of images to Meilisearch")?;
-                pb.inc(1);
                 Ok(())
             })
             .await?;
+            pb.inc(1);
             buffer.clear();
             current_chunk_size = 0;
+        }
+
+        if pb.position() % CLEAR_MEILISEARCH_IMAGES_FREQUENCY == 0 {
+            send_clear_images_from_documents(
+                &client,
+                &meili_client,
+                &edit_documents_to_clear_images,
+            )
+            .await?;
         }
 
         buffer.push(image);
@@ -352,10 +374,45 @@ async fn images_uploader(
                 .add_documents(&buffer, None)
                 .await
                 .context("While sending a chunk of images to Meilisearch")?;
-            pb.inc(1);
             Ok(())
         })
         .await?;
+        pb.inc(1);
+    }
+
+    // Just to make sure we don't send a request if we are in dry-run mode
+    if pb.position() != 0 {
+        send_clear_images_from_documents(&client, &meili_client, &edit_documents_to_clear_images)
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Sends a edit-documents-by-function request to remove the images from documents.
+async fn send_clear_images_from_documents(
+    client: &reqwest::Client,
+    meili_client: &MeiliClient,
+    edit_documents_to_clear_images: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let host = meili_client.get_host();
+    let url = format!("{host}/indexes/images/documents/edit");
+
+    let request_builder = client.post(url);
+    let request_builder = match meili_client.get_api_key() {
+        Some(api_key) => request_builder.header(AUTHORIZATION, api_key),
+        None => request_builder,
+    };
+
+    let response = request_builder
+        .json(edit_documents_to_clear_images)
+        .send()
+        .await
+        .context("While sending a request to clear images")?;
+    let status = response.status();
+    let text = response.text().await.context("While parsing response from Meilisearch")?;
+    if !status.is_success() {
+        error!("Failed to clear images: {text}");
     }
 
     Ok(())

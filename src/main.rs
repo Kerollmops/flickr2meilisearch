@@ -61,6 +61,10 @@ struct Args {
     /// The frequency in terms of number of sent images at which we clear images from Meilisearch
     #[arg(long, default_value = "100000")]
     clear_images_frequency: u64,
+
+    /// Skip the first n images in the bucket
+    #[arg(long, default_value = "0")]
+    skip_first_images: u64,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -74,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         max_in_flight_downloads,
         meili_chunk_size,
         clear_images_frequency,
+        skip_first_images,
     } = Args::parse();
 
     // install global subscriber configured based on RUST_LOG envvar.
@@ -136,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 iterator_pb,
                 images_to_download_sender,
                 presigned_url_duration,
+                skip_first_images,
             )
             .await
         }
@@ -208,8 +214,10 @@ async fn iterate_through_objects(
     pb: ProgressBar,
     images_to_download_sender: Sender<ListObjectsContent>,
     presigned_url_duration: Duration,
+    skip_first_images: u64,
 ) -> anyhow::Result<()> {
     let mut continuation_token = None;
+    let mut skipped_count = 0u64;
     loop {
         let mut list_action = bucket.list_objects_v2(None);
         list_action.with_prefix("data/images");
@@ -237,7 +245,11 @@ async fn iterate_through_objects(
         .await?;
 
         for content in list.contents {
-            images_to_download_sender.send(content).await?;
+            if skipped_count < skip_first_images {
+                skipped_count += 1;
+            } else {
+                images_to_download_sender.send(content).await?;
+            }
             pb.inc(1);
         }
 

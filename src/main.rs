@@ -51,7 +51,7 @@ struct Args {
     presigned_url_duration_secs: u64,
 
     /// Maximum number of downloads in flight at any given time
-    #[arg(long, default_value = "2000")]
+    #[arg(long, default_value = "500")]
     max_in_flight_downloads: usize,
 
     /// Maximum size of a chunk to send to Meilisearch

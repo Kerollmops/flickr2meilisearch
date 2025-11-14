@@ -13,6 +13,7 @@ use byte_unit::Byte;
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use image::ImageReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
@@ -23,6 +24,8 @@ use rusty_s3::actions::list_objects_v2::ListObjectsContent;
 use rusty_s3::{Bucket, S3Action, UrlStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
+use std::io::Cursor;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 
@@ -168,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
     let compute_base64_handle = tokio::task::spawn_blocking(move || {
         let pool = rayon::ThreadPoolBuilder::new().build()?;
         pool.install(|| {
-            compute_images_base64(
+            filter_and_compute_images_base64(
                 base64_encoder_pb,
                 // Dry running will make the pipeline go up to this point
                 // and don't send to Meilisearch
@@ -340,20 +343,53 @@ async fn download_images(
     Ok(())
 }
 
-fn compute_images_base64(
+/// Check if image is monochrome or has very few colors
+fn is_image_valid(image_bytes: &[u8]) -> anyhow::Result<bool> {
+    use rayon::prelude::*;
+
+    let cursor = Cursor::new(image_bytes);
+    let reader = ImageReader::new(cursor).with_guessed_format()?;
+    let image = reader.decode()?;
+
+    let rgb_image = image.to_rgb8();
+
+    // Use rayon to process pixels in parallel
+    let unique_colors: HashSet<_> = rgb_image
+        .pixels()
+        .par_bridge()
+        .map(|pixel| (pixel[0] / 16, pixel[1] / 16, pixel[2] / 16))
+        .collect();
+
+    // Consider image invalid if it has 100 or fewer unique colors (likely monochrome or very simple)
+    Ok(unique_colors.len() > 20)
+}
+
+fn filter_and_compute_images_base64(
     pb: ProgressBar,
     dry_run: bool,
     images_to_compute_base64_receiver: StdReceiver<(ListObjectsContent, Bytes)>,
     base64_to_upload_sender: Sender<(ListObjectsContent, String)>,
 ) -> anyhow::Result<()> {
     images_to_compute_base64_receiver.into_iter().par_bridge().try_for_each(|(content, bytes)| {
-        let base64 = BASE64_STANDARD.encode(&bytes);
+        pb.inc(1);
+        // Check if the image is valid (not monochrome or has sufficient colors)
+        let base64 = match is_image_valid(&bytes) {
+            Ok(is_valid) if is_valid => BASE64_STANDARD.encode(&bytes),
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                // If we can't decode the image, skip it
+                error!("Failed to decode image {}: {}", content.key, e);
+                return Ok(());
+            }
+        };
+
+        // Continue with normal processing for valid images
         if !dry_run {
             base64_to_upload_sender
                 .blocking_send((content, base64))
                 .context("While sending the base64 to the uploader")?;
         }
-        pb.inc(1);
+
         Ok(())
     })
 }

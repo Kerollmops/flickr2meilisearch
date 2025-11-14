@@ -126,12 +126,19 @@ async fn main() -> anyhow::Result<()> {
     let uploader_pb = ProgressBar::new_spinner().with_style(
         ProgressStyle::with_template("[{elapsed}] Uploader {binary_bytes_per_sec}").unwrap(),
     );
+    let deleted_pb = ProgressBar::new(total_images).with_style(
+        ProgressStyle::with_template(
+            "[{elapsed}] Deleted Images {human_pos}/{human_len} ({per_sec})",
+        )
+        .unwrap(),
+    );
 
     let mpb = MultiProgress::new();
     let iterator_pb = mpb.add(iterator_pb);
     let downloaded_pb = mpb.add(downloaded_pb);
     let base64_encoder_pb = mpb.add(base64_encoder_pb);
     let uploader_pb = mpb.add(uploader_pb);
+    let deleted_pb = mpb.add(deleted_pb);
 
     let iterator_handle = tokio::spawn({
         let client = client.clone();
@@ -190,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                 client,
                 meili_client,
                 uploader_pb,
+                deleted_pb,
                 operation_receiver,
                 meili_chunk_size,
                 clear_frequency,
@@ -426,6 +434,7 @@ async fn images_uploader(
     client: reqwest::Client,
     meili_client: MeiliClient,
     pb: ProgressBar,
+    deleted_pb: ProgressBar,
     mut operation_receiver: Receiver<Operation>,
     meili_chunk_size: usize,
     clear_images_frequency: u64,
@@ -500,7 +509,7 @@ async fn images_uploader(
                         Ok(())
                     })
                     .await?;
-                    pb.inc(ids_to_delete.len() as u64);
+                    deleted_pb.inc(ids_to_delete.len() as u64);
                 }
             }
         }
@@ -528,6 +537,7 @@ async fn images_uploader(
             Ok(())
         })
         .await?;
+        deleted_pb.inc(delete_batch.len() as u64);
     }
 
     // Just to make sure we don't send a request if we are in dry-run mode

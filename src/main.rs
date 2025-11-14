@@ -22,7 +22,7 @@ use reqwest::header::AUTHORIZATION;
 use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::actions::list_objects_v2::ListObjectsContent;
 use rusty_s3::{Bucket, S3Action, UrlStyle};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let (images_to_download_sender, images_to_download_receiver) = tokio::sync::mpsc::channel(200);
     let (images_to_compute_base64_sender, images_to_compute_base64_receiver) =
         std::sync::mpsc::sync_channel(200);
-    let (base64_to_upload_sender, base64_to_upload_receiver) = tokio::sync::mpsc::channel(200);
+    let (operation_sender, operation_receiver) = tokio::sync::mpsc::channel(200);
 
     let iterator_pb = ProgressBar::new(total_images).with_style(
         ProgressStyle::with_template(
@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 // and don't send to Meilisearch
                 dry_run,
                 images_to_compute_base64_receiver,
-                base64_to_upload_sender,
+                operation_sender,
             )
         })
     });
@@ -190,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 client,
                 meili_client,
                 uploader_pb,
-                base64_to_upload_receiver,
+                operation_receiver,
                 meili_chunk_size,
                 clear_frequency,
             )
@@ -368,33 +368,54 @@ fn filter_and_compute_images_base64(
     pb: ProgressBar,
     dry_run: bool,
     images_to_compute_base64_receiver: StdReceiver<(ListObjectsContent, Bytes)>,
-    base64_to_upload_sender: Sender<(ListObjectsContent, String)>,
+    operation_sender: Sender<Operation>,
 ) -> anyhow::Result<()> {
     images_to_compute_base64_receiver.into_iter().par_bridge().try_for_each(|(content, bytes)| {
         pb.inc(1);
         // Check if the image is valid (not monochrome or has sufficient colors)
-        let base64 = match is_image_valid(&bytes) {
-            Ok(is_valid) if is_valid => BASE64_STANDARD.encode(&bytes),
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                // If we can't decode the image, skip it
-                error!("Failed to decode image {}: {}", content.key, e);
-                return Ok(());
+        match is_image_valid(&bytes) {
+            Ok(is_valid) => {
+                if is_valid {
+                    // Valid image - encode and send upload operation
+                    let base64 = BASE64_STANDARD.encode(&bytes);
+                    if !dry_run {
+                        operation_sender
+                            .blocking_send(Operation::Upload(content, base64))
+                            .context("While sending upload operation")?;
+                    }
+                } else {
+                    // Invalid image - send delete operation
+                    let key = &content.key;
+                    let id = match Cow::from_slash(key).file_stem() {
+                        Some(stem) => stem.to_string_lossy().to_string(),
+                        None => {
+                            error!("Image key `{key}` does not have a valid file stem");
+                            pb.inc(1);
+                            return Ok(());
+                        }
+                    };
+                    if !dry_run {
+                        operation_sender
+                            .blocking_send(Operation::Delete(id))
+                            .context("While sending delete operation")?;
+                    }
+                }
             }
-        };
-
-        // Continue with normal processing for valid images
-        if !dry_run {
-            base64_to_upload_sender
-                .blocking_send((content, base64))
-                .context("While sending the base64 to the uploader")?;
+            // If we can't decode the image, skip it
+            Err(e) => error!("Failed to decode image {}: {}", content.key, e),
         }
 
         Ok(())
     })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
+enum Operation {
+    Upload(ListObjectsContent, String),
+    Delete(String),
+}
+
+#[derive(Serialize)]
 struct Image {
     id: String,
     url: String,
@@ -405,7 +426,7 @@ async fn images_uploader(
     client: reqwest::Client,
     meili_client: MeiliClient,
     pb: ProgressBar,
-    mut base64_to_upload_receiver: Receiver<(ListObjectsContent, String)>,
+    mut operation_receiver: Receiver<Operation>,
     meili_chunk_size: usize,
     clear_images_frequency: u64,
 ) -> anyhow::Result<()> {
@@ -417,51 +438,72 @@ async fn images_uploader(
 
     let mut buffer = Vec::new();
     let mut current_chunk_size = 0;
-    while let Some((content, base64)) = base64_to_upload_receiver.recv().await {
-        let ListObjectsContent { key, .. } = content;
-        let id = match Cow::from_slash(&key).file_stem() {
-            Some(stem) => stem.to_string_lossy().to_string(),
-            None => {
-                error!("Image key `{key}` does not have a valid file stem");
-                continue;
+    let mut delete_batch = Vec::new();
+
+    while let Some(operation) = operation_receiver.recv().await {
+        match operation {
+            Operation::Upload(content, base64) => {
+                let ListObjectsContent { key, .. } = content;
+                let id = match Cow::from_slash(&key).file_stem() {
+                    Some(stem) => stem.to_string_lossy().to_string(),
+                    None => {
+                        error!("Image key `{key}` does not have a valid file stem");
+                        continue;
+                    }
+                };
+
+                let image = Image {
+                    id,
+                    url: format!("https://multimedia-commons.s3-us-west-2.amazonaws.com/{key}"),
+                    base64,
+                };
+
+                let mut bytes_counter = BytesCounter::default();
+                serde_json::to_writer(&mut bytes_counter, &image)?;
+                let BytesCounter { count } = bytes_counter;
+
+                if current_chunk_size + count >= meili_chunk_size {
+                    backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
+                        images
+                            .add_documents(&buffer, None)
+                            .await
+                            .context("While sending a chunk of images to Meilisearch")?;
+                        Ok(())
+                    })
+                    .await?;
+                    pb.inc(current_chunk_size as u64);
+                    buffer.clear();
+                    current_chunk_size = 0;
+                }
+
+                if pb.position() != 0 && pb.position() % clear_images_frequency == 0 {
+                    send_clear_images_from_documents(
+                        &client,
+                        &meili_client,
+                        &edit_documents_to_clear_images,
+                    )
+                    .await?;
+                }
+
+                buffer.push(image);
+                current_chunk_size += count;
             }
-        };
-
-        let image = Image {
-            id,
-            url: format!("https://multimedia-commons.s3-us-west-2.amazonaws.com/{key}"),
-            base64,
-        };
-
-        let mut bytes_counter = BytesCounter::default();
-        serde_json::to_writer(&mut bytes_counter, &image)?;
-        let BytesCounter { count } = bytes_counter;
-
-        if current_chunk_size + count >= meili_chunk_size {
-            backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
-                images
-                    .add_documents(&buffer, None)
-                    .await
-                    .context("While sending a chunk of images to Meilisearch")?;
-                Ok(())
-            })
-            .await?;
-            pb.inc(current_chunk_size as u64);
-            buffer.clear();
-            current_chunk_size = 0;
+            Operation::Delete(id) => {
+                delete_batch.push(id);
+                if delete_batch.len() >= 1000 {
+                    let ids_to_delete: Vec<String> = delete_batch.drain(..).collect();
+                    backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
+                        images
+                            .delete_documents(&ids_to_delete)
+                            .await
+                            .context("While deleting a batch of images from Meilisearch")?;
+                        Ok(())
+                    })
+                    .await?;
+                    pb.inc(ids_to_delete.len() as u64);
+                }
+            }
         }
-
-        if pb.position() != 0 && pb.position() % clear_images_frequency == 0 {
-            send_clear_images_from_documents(
-                &client,
-                &meili_client,
-                &edit_documents_to_clear_images,
-            )
-            .await?;
-        }
-
-        buffer.push(image);
-        current_chunk_size += count;
     }
 
     // Don't forget to send the last chunk
@@ -471,6 +513,18 @@ async fn images_uploader(
                 .add_documents(&buffer, None)
                 .await
                 .context("While sending a chunk of images to Meilisearch")?;
+            Ok(())
+        })
+        .await?;
+    }
+
+    // Don't forget to send the remaining deletions
+    if !delete_batch.is_empty() {
+        backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
+            images
+                .delete_documents(&delete_batch)
+                .await
+                .context("While deleting remaining images from Meilisearch")?;
             Ok(())
         })
         .await?;

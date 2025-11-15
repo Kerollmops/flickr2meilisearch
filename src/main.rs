@@ -68,6 +68,10 @@ struct Args {
     /// Skip the first n images in the bucket
     #[arg(long, default_value = "0")]
     skip_first_images: u64,
+
+    /// Only delete invalid images and don't upload valid ones
+    #[arg(long)]
+    only_delete: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -82,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         meili_chunk_size,
         clear_images_frequency,
         skip_first_images,
+        only_delete,
     } = Args::parse();
 
     // install global subscriber configured based on RUST_LOG envvar.
@@ -183,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                 // Dry running will make the pipeline go up to this point
                 // and don't send to Meilisearch
                 dry_run,
+                only_delete,
                 images_to_compute_base64_receiver,
                 operation_sender,
             )
@@ -375,6 +381,7 @@ fn is_image_valid(image_bytes: &[u8]) -> anyhow::Result<bool> {
 fn filter_and_compute_images_base64(
     pb: ProgressBar,
     dry_run: bool,
+    only_delete: bool,
     images_to_compute_base64_receiver: StdReceiver<(ListObjectsContent, Bytes)>,
     operation_sender: Sender<Operation>,
 ) -> anyhow::Result<()> {
@@ -384,15 +391,17 @@ fn filter_and_compute_images_base64(
         match is_image_valid(&bytes) {
             Ok(is_valid) => {
                 if is_valid {
-                    // Valid image - encode and send upload operation
-                    let base64 = BASE64_STANDARD.encode(&bytes);
-                    if !dry_run {
-                        operation_sender
-                            .blocking_send(Operation::Upload(content, base64))
-                            .context("While sending upload operation")?;
+                    // Valid image - only upload if not in only-delete mode
+                    if !only_delete {
+                        let base64 = BASE64_STANDARD.encode(&bytes);
+                        if !dry_run {
+                            operation_sender
+                                .blocking_send(Operation::Upload(content, base64))
+                                .context("While sending upload operation")?;
+                        }
                     }
                 } else {
-                    // Invalid image - send delete operation
+                    // Invalid image - always send delete operation
                     let key = &content.key;
                     let id = match Cow::from_slash(key).file_stem() {
                         Some(stem) => stem.to_string_lossy().to_string(),

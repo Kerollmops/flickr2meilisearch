@@ -1,5 +1,7 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender};
@@ -7,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use backoff::ExponentialBackoff;
-use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
+use base64::Engine as _;
 use byte_unit::Byte;
 use bytes::Bytes;
 use clap::Parser;
@@ -19,13 +21,11 @@ use meilisearch_sdk::client::Client as MeiliClient;
 use path_slash::CowExt as _;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use reqwest::header::AUTHORIZATION;
-use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::actions::list_objects_v2::ListObjectsContent;
+use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, S3Action, UrlStyle};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
-use std::io::Cursor;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 
@@ -472,14 +472,20 @@ async fn images_uploader(
                 let BytesCounter { count } = bytes_counter;
 
                 if current_chunk_size + count >= meili_chunk_size {
-                    backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
-                        images
-                            .add_documents(&buffer, None)
-                            .await
-                            .context("While sending a chunk of images to Meilisearch")?;
-                        Ok(())
-                    })
-                    .await?;
+                    let result =
+                        backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
+                            images
+                                .add_documents(&buffer, None)
+                                .await
+                                .context("While sending a chunk of images to Meilisearch")?;
+                            Ok(())
+                        })
+                        .await;
+
+                    if let Err(err) = result {
+                        error!("Error sending chunk: {}", err);
+                    }
+
                     pb.inc(current_chunk_size as u64);
                     buffer.clear();
                     current_chunk_size = 0;
